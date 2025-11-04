@@ -1,4 +1,3 @@
-root@isz:~/disp# cat index.js
 const amqp = require('amqplib');
 const axios = require('axios');
 const express = require('express');
