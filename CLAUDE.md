@@ -34,6 +34,7 @@ Required environment variables:
 - `FINISH_WEBHOOK`: Webhook URL called when a queue is emptied (required)
 - `REDIS_URL`: Redis connection URL for persistence (default: redis://localhost:6379)
 - `API_PORT`: API server port (default: 3000)
+- `MAX_RECONNECT_ATTEMPTS`: Maximum reconnection attempts before forcing container restart (default: 10)
 
 ## Architecture
 
@@ -168,9 +169,29 @@ On service start, after RabbitMQ connection:
 3. If queue no longer exists in RabbitMQ, removes the stale config from Redis
 4. Restores paused state if applicable
 
-**Channel Recreation:**
-When RabbitMQ channel closes (e.g., deleted queue):
-1. Service automatically recreates the channel
-2. Attempts to restore all consumers from Redis
-3. Logs failures for queues that no longer exist
-4. Service continues running without crash
+**Automatic Reconnection System** (index.js:131-248)
+The service has a robust multi-level reconnection strategy:
+
+**Connection/Channel Error Handling:**
+1. When a channel error occurs, checks if the connection is still alive
+2. If connection is alive → recreates only the channel (faster recovery)
+3. If connection is lost → performs full reconnection (connection + channel)
+4. Both connection and channel have event handlers for `error` and `close` events
+
+**Reconnection Attempts:**
+- Tracks consecutive reconnection attempts with `reconnectAttempts` counter
+- Resets counter to 0 after successful reconnection
+- If reconnection fails `MAX_RECONNECT_ATTEMPTS` times (default: 10):
+  - Logs failure message
+  - Gracefully closes all resources (channel, connection, Redis)
+  - Exits process with code 1
+  - Docker/Kubernetes will automatically restart the container
+  - On restart, consumers are restored from Redis
+
+**Recovery Timeline:**
+- Channel-only recreation: 2 second retry interval
+- Full reconnection: 5 second retry interval
+- After each successful reconnection, all consumers are restored from Redis
+
+**Why Force Restart:**
+In extreme cases where reconnection consistently fails (e.g., network issues, RabbitMQ cluster changes, corrupted state), forcing a container restart provides a clean slate while maintaining consumer configurations via Redis persistence.

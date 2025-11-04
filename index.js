@@ -9,6 +9,7 @@ const API_PORT = process.env.API_PORT || 3000;
 const TIMEZONE = 'America/Sao_Paulo';
 const FINISH_WEBHOOK = process.env.FINISH_WEBHOOK;
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const MAX_RECONNECT_ATTEMPTS = parseInt(process.env.MAX_RECONNECT_ATTEMPTS) || 10;
 
 class RabbitMQConsumer {
     constructor() {
@@ -18,6 +19,8 @@ class RabbitMQConsumer {
         this.queueIntervals = {};
         this.activeConsumers = new Map();
         this.isReconnecting = false;
+        this.reconnectAttempts = 0;
+        this.lastSuccessfulConnection = Date.now();
         this.redis = new Redis(REDIS_URL, {
             retryStrategy(times) {
                 const delay = Math.min(times * 50, 2000);
@@ -125,37 +128,90 @@ class RabbitMQConsumer {
         }
     }
 
-    async recreateChannel() {
+    async reconnect() {
         if (this.isReconnecting) {
-            console.log('Channel recreation already in progress');
+            console.log('Reconnection already in progress');
             return;
         }
 
         this.isReconnecting = true;
-        console.log('Recreating channel...');
+        this.reconnectAttempts++;
+
+        console.log(`Reconnecting to RabbitMQ... (attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+
+        // Verificar se atingiu o limite de tentativas
+        if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            console.error(`Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts`);
+            console.log('Forcing container restart by exiting process...');
+
+            // Fechar recursos antes de sair
+            try {
+                if (this.channel) await this.channel.close();
+                if (this.connection) await this.connection.close();
+                if (this.redis) await this.redis.quit();
+            } catch (err) {
+                console.error('Error closing resources:', err);
+            }
+
+            // Exit com código 1 para sinalizar erro - o Docker/Kubernetes vai reiniciar o container
+            process.exit(1);
+        }
 
         // Salvar consumers ativos antes de limpar
         const consumersToRestore = new Map(this.activeConsumers);
 
         try {
+            // Fechar conexão e channel existentes
             if (this.channel) {
                 try {
                     await this.channel.close();
                 } catch (err) {
-                    // Channel might already be closed
+                    console.log('Channel already closed');
                 }
             }
 
+            if (this.connection) {
+                try {
+                    await this.connection.close();
+                } catch (err) {
+                    console.log('Connection already closed');
+                }
+            }
+
+            // Criar nova conexão
+            this.connection = await amqp.connect(RABBITMQ_URL);
+
+            // Handlers da conexão
+            this.connection.on('error', (err) => {
+                console.error('Connection error:', err);
+                // Não chamar reconnect aqui, deixar o event close fazer isso
+            });
+
+            this.connection.on('close', () => {
+                console.log('Connection closed, will reconnect');
+                setTimeout(() => this.reconnect(), 5000);
+            });
+
+            // Criar novo channel
             this.channel = await this.connection.createChannel();
             await this.channel.prefetch(1);
 
+            // Handlers do channel
             this.channel.on('error', (err) => {
                 console.error('Channel error:', err);
+                // Não chamar reconnect aqui, deixar o event close fazer isso
             });
 
-            this.channel.on('close', async () => {
-                console.log('Channel closed, will recreate');
-                await this.recreateChannel();
+            this.channel.on('close', () => {
+                console.log('Channel closed unexpectedly');
+                // Se a conexão ainda está viva, tentar recriar só o channel
+                if (this.connection && !this.connection.connection.stream.destroyed) {
+                    console.log('Connection still alive, recreating channel only');
+                    this.recreateChannelOnly();
+                } else {
+                    console.log('Connection lost, full reconnect needed');
+                    setTimeout(() => this.reconnect(), 5000);
+                }
             });
 
             this.channel.on('cancel', async (consumerTag) => {
@@ -164,6 +220,77 @@ class RabbitMQConsumer {
                         await this.notifyQueueFinish(queue, data.lastMessage);
                         console.log(`Queue ${queue} was deleted or cancelled`);
                         this.activeConsumers.delete(queue);
+                        await this.deleteConsumerFromRedis(queue);
+                        break;
+                    }
+                }
+            });
+
+            console.log('Reconnected to RabbitMQ successfully');
+
+            // Reset do contador após reconexão bem-sucedida
+            this.reconnectAttempts = 0;
+            this.lastSuccessfulConnection = Date.now();
+
+            // Limpar antes de recriar
+            this.activeConsumers.clear();
+
+            // Restaurar consumers salvos no Redis
+            await this.loadConsumersFromRedis();
+
+        } catch (error) {
+            console.error('Error during reconnection:', error);
+            console.log('Retrying reconnection in 5 seconds...');
+            setTimeout(() => this.reconnect(), 5000);
+        } finally {
+            this.isReconnecting = false;
+        }
+    }
+
+    async recreateChannelOnly() {
+        if (this.isReconnecting) {
+            console.log('Channel recreation already in progress');
+            return;
+        }
+
+        this.isReconnecting = true;
+        console.log('Recreating channel only...');
+
+        try {
+            if (this.channel) {
+                try {
+                    await this.channel.close();
+                } catch (err) {
+                    console.log('Channel already closed');
+                }
+            }
+
+            this.channel = await this.connection.createChannel();
+            await this.channel.prefetch(1);
+
+            // Handlers do channel
+            this.channel.on('error', (err) => {
+                console.error('Channel error:', err);
+            });
+
+            this.channel.on('close', () => {
+                console.log('Channel closed unexpectedly');
+                if (this.connection && !this.connection.connection.stream.destroyed) {
+                    console.log('Connection still alive, recreating channel only');
+                    setTimeout(() => this.recreateChannelOnly(), 2000);
+                } else {
+                    console.log('Connection lost, full reconnect needed');
+                    setTimeout(() => this.reconnect(), 5000);
+                }
+            });
+
+            this.channel.on('cancel', async (consumerTag) => {
+                for (const [queue, data] of this.activeConsumers.entries()) {
+                    if (data.consumerTag === consumerTag) {
+                        await this.notifyQueueFinish(queue, data.lastMessage);
+                        console.log(`Queue ${queue} was deleted or cancelled`);
+                        this.activeConsumers.delete(queue);
+                        await this.deleteConsumerFromRedis(queue);
                         break;
                     }
                 }
@@ -174,27 +301,14 @@ class RabbitMQConsumer {
             // Limpar antes de recriar
             this.activeConsumers.clear();
 
-            // Recriar consumers que estavam ativos
-            if (consumersToRestore.size > 0) {
-                console.log(`Restoring ${consumersToRestore.size} consumers...`);
-                for (const [queue, data] of consumersToRestore.entries()) {
-                    try {
-                        await this.startConsuming(
-                            queue,
-                            data.webhook,
-                            data.minInterval,
-                            data.maxInterval,
-                            data.businessHours
-                        );
-                        console.log(`Restored consumer for queue ${queue}`);
-                    } catch (error) {
-                        console.error(`Failed to restore consumer for queue ${queue}:`, error.message);
-                    }
-                }
-            }
+            // Restaurar consumers do Redis
+            await this.loadConsumersFromRedis();
+
         } catch (error) {
             console.error('Error recreating channel:', error);
-            setTimeout(() => this.recreateChannel(), 5000);
+            // Se falhar em recriar o channel, provavelmente a conexão está ruim
+            console.log('Channel recreation failed, attempting full reconnect...');
+            setTimeout(() => this.reconnect(), 5000);
         } finally {
             this.isReconnecting = false;
         }
@@ -608,16 +722,38 @@ class RabbitMQConsumer {
     async connect() {
         try {
             this.connection = await amqp.connect(RABBITMQ_URL);
+
+            // Handlers da conexão
+            this.connection.on('error', (err) => {
+                console.error('Connection error:', err);
+                // Não chamar reconnect aqui, deixar o event close fazer isso
+            });
+
+            this.connection.on('close', () => {
+                console.log('Connection closed unexpectedly, will reconnect');
+                setTimeout(() => this.reconnect(), 5000);
+            });
+
+            // Criar channel
             this.channel = await this.connection.createChannel();
             await this.channel.prefetch(1);
 
+            // Handlers do channel
             this.channel.on('error', (err) => {
                 console.error('Channel error:', err);
+                // Não chamar reconnect aqui, deixar o event close fazer isso
             });
 
-            this.channel.on('close', async () => {
-                console.log('Channel closed, will recreate');
-                await this.recreateChannel();
+            this.channel.on('close', () => {
+                console.log('Channel closed unexpectedly');
+                // Se a conexão ainda está viva, tentar recriar só o channel
+                if (this.connection && !this.connection.connection.stream.destroyed) {
+                    console.log('Connection still alive, recreating channel only');
+                    this.recreateChannelOnly();
+                } else {
+                    console.log('Connection lost, full reconnect needed');
+                    setTimeout(() => this.reconnect(), 5000);
+                }
             });
 
             this.channel.on('cancel', async (consumerTag) => {
@@ -626,6 +762,7 @@ class RabbitMQConsumer {
                         await this.notifyQueueFinish(queue, data.lastMessage);
                         console.log(`Queue ${queue} was deleted or cancelled`);
                         this.activeConsumers.delete(queue);
+                        await this.deleteConsumerFromRedis(queue);
                         break;
                     }
                 }
@@ -633,8 +770,9 @@ class RabbitMQConsumer {
 
             console.log('Connected to RabbitMQ');
         } catch (error) {
-            console.error('Connection error:', error);
-            process.exit(1);
+            console.error('Initial connection error:', error);
+            console.log('Retrying initial connection in 5 seconds...');
+            setTimeout(() => this.connect(), 5000);
         }
     }
 
