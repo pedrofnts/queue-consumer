@@ -1,0 +1,30 @@
+
+version: "3.7"
+services:
+  consumer:
+    image: rabbitmq-consumer:latest
+    networks:
+      - isz
+    environment:
+      RABBITMQ_URL: amqp://iszp:40e113ad1f5c72a411a46e1fd2d57e4b@rabbitmq:5672
+      FINISH_WEBHOOK: https://req.iszap.com.br/webhook/finish
+      API_PORT: 3000
+      NODE_OPTIONS: "--max-old-space-size=4096"
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - traefik.enable=1
+        - traefik.http.routers.consumer.rule=Host(`gate.iszap.com.br`)
+        - traefik.http.routers.consumer.entrypoints=websecure
+        - traefik.http.routers.consumer.priority=1
+        - traefik.http.routers.consumer.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.consumer.service=consumer
+        - traefik.http.services.consumer.loadbalancer.server.port=3000
+
+networks:
+  isz:
+    external: true
