@@ -18,6 +18,7 @@ class RabbitMQConsumer {
         this.lastSend = {};
         this.connection = null;
         this.channel = null;
+        this.channelVersion = 0;  // Versão do channel para invalidar callbacks antigas
         this.queueIntervals = {};
         this.activeConsumers = new Map();
         this.isReconnecting = false;
@@ -181,14 +182,19 @@ class RabbitMQConsumer {
             console.log(`📊 Found ${consumers.length} consumers in database to restore`);
             
             if (consumers.length > 0) {
-                console.log('✅ Consumers to restore:', consumers.map(c => c.queue).join(', '));
+                console.log('🔄 Consumers to restore:', consumers.map(c => c.queue).join(', '));
             } else {
                 console.log('⚠️  No consumers found - database may be empty or checkpoint failed');
+                return; // Não precisa continuar
             }
+
+            let restoredCount = 0;
+            let failedCount = 0;
 
             for (const config of consumers) {
                 if (!config.webhook) {
-                    console.log(`Invalid config for ${config.queue}, skipping`);
+                    console.log(`❌ Invalid config for ${config.queue}, skipping`);
+                    failedCount++;
                     continue;
                 }
 
@@ -214,14 +220,22 @@ class RabbitMQConsumer {
                         consumer.paused = paused;
                     }
 
-                    console.log(`Restored consumer for queue ${config.queue}${paused ? ' (paused)' : ''}`);
+                    console.log(`✅ Restored consumer for queue ${config.queue}${paused ? ' (paused)' : ''}`);
+                    restoredCount++;
                 } catch (error) {
-                    console.error(`Failed to restore consumer for queue ${config.queue}:`, error.message);
+                    console.error(`❌ Failed to restore consumer for queue ${config.queue}:`, error.message);
+                    failedCount++;
                     // Se a fila não existe mais, remove do banco
                     if (error.message.includes('does not exist')) {
                         this.deleteConsumerFromDb(config.queue);
                     }
                 }
+            }
+
+            console.log(`📊 Restoration complete: ${restoredCount} succeeded, ${failedCount} failed`);
+            
+            if (restoredCount > 0) {
+                console.log(`🎉 Successfully restored consumers: ${Array.from(this.activeConsumers.keys()).join(', ')}`);
             }
         } catch (error) {
             console.error('CRITICAL: Error loading consumers from database:', error);
@@ -300,6 +314,8 @@ class RabbitMQConsumer {
 
             // Criar novo channel
             this.channel = await this.connection.createChannel();
+            this.channelVersion++;  // Incrementar versão para invalidar callbacks antigas
+            console.log(`Created channel version ${this.channelVersion}`);
             await this.channel.prefetch(1);
 
             // Handlers do channel
@@ -372,6 +388,8 @@ class RabbitMQConsumer {
             }
 
             this.channel = await this.connection.createChannel();
+            this.channelVersion++;  // Incrementar versão para invalidar callbacks antigas
+            console.log(`Recreated channel version ${this.channelVersion}`);
             await this.channel.prefetch(1);
 
             // Handlers do channel
@@ -703,18 +721,28 @@ class RabbitMQConsumer {
             await this.channel.checkQueue(queue);
             await this.channel.prefetch(1);
 
+            // Capturar versão do channel ANTES de criar o consumer
+            const consumerChannelVersion = this.channelVersion;
+            console.log(`Starting consumer for queue ${queue} on channel version ${consumerChannelVersion}`);
+
             const consumer = await this.channel.consume(queue, async (msg) => {
                 if (msg === null) {
                     this.activeConsumers.delete(queue);
                     return;
                 }
 
+                // Verificar se esta callback ainda é válida (channel não foi recriado)
+                if (consumerChannelVersion !== this.channelVersion) {
+                    console.log(`Ignoring message from queue ${queue} - channel version mismatch (${consumerChannelVersion} vs ${this.channelVersion})`);
+                    return;
+                }
+
                 try {
                     await new Promise(resolve => setTimeout(resolve, this.queueIntervals[queue] || this.getRandomInterval(minInterval, maxInterval)));
-                    await this.processMessage(msg, queue, webhook, minInterval, maxInterval, businessHours);
+                    await this.processMessage(msg, queue, webhook, minInterval, maxInterval, businessHours, consumerChannelVersion);
                 } catch (error) {
                     console.error(`Error processing message from queue ${queue}:`, error);
-                    if (this.isChannelOpen()) {
+                    if (this.isChannelOpen() && consumerChannelVersion === this.channelVersion) {
                         try {
                             this.channel.nack(msg, false, true);
                         } catch (nackError) {
@@ -731,7 +759,8 @@ class RabbitMQConsumer {
                 maxInterval,
                 businessHours,
                 lastMessage: null,
-                paused: false
+                paused: false,
+                channelVersion: consumerChannelVersion  // Armazenar versão
             });
 
             this.queueIntervals[queue] = this.getRandomInterval(minInterval, maxInterval);
@@ -762,8 +791,14 @@ class RabbitMQConsumer {
         }
     }
 
-    async processMessage(msg, queue, webhook, minInterval, maxInterval, businessHours) {
+    async processMessage(msg, queue, webhook, minInterval, maxInterval, businessHours, expectedChannelVersion) {
         if (!msg) return;
+
+        // Verificar se esta callback ainda é válida
+        if (expectedChannelVersion !== this.channelVersion) {
+            console.log(`Skipping message processing for queue ${queue} - channel version mismatch`);
+            return;
+        }
 
         if (!this.isChannelOpen()) {
             console.log(`Channel is closed, cannot process message from queue ${queue}`);
@@ -772,7 +807,7 @@ class RabbitMQConsumer {
 
         const consumer = this.activeConsumers.get(queue);
         if (consumer && consumer.paused) {
-            if (this.isChannelOpen()) {
+            if (this.isChannelOpen() && expectedChannelVersion === this.channelVersion) {
                 this.channel.nack(msg, false, true);
                 console.log(`Queue ${queue} is paused, message returned to queue`);
             }
@@ -780,7 +815,7 @@ class RabbitMQConsumer {
         }
 
         if (!this.isWithinBusinessHours(businessHours)) {
-            if (this.isChannelOpen()) {
+            if (this.isChannelOpen() && expectedChannelVersion === this.channelVersion) {
                 this.channel.nack(msg, false, true);
                 console.log(`Outside business hours (${businessHours.start}-${businessHours.end}), message returned to queue ${queue}`);
             }
@@ -793,22 +828,26 @@ class RabbitMQConsumer {
 
             await axios.post(webhook, messageContent);
 
-            if (this.isChannelOpen()) {
+            // Verificar versão antes de ack
+            if (this.isChannelOpen() && expectedChannelVersion === this.channelVersion) {
                 this.channel.ack(msg);
+            } else {
+                console.log(`Skipping ack for queue ${queue} - channel changed`);
+                return;
             }
 
             if (consumer) {
                 consumer.lastMessage = messageContent;
             }
 
-            if (!this.isChannelOpen()) {
-                console.log(`Channel closed while processing queue ${queue}`);
+            if (!this.isChannelOpen() || expectedChannelVersion !== this.channelVersion) {
+                console.log(`Channel changed while processing queue ${queue}`);
                 return;
             }
 
             const queueInfo = await this.channel.checkQueue(queue);
             if (queueInfo.messageCount === 0) {
-                if (consumer && this.isChannelOpen()) {
+                if (consumer && this.isChannelOpen() && expectedChannelVersion === this.channelVersion) {
                     await this.channel.cancel(consumer.consumerTag);
                     await this.notifyQueueFinish(queue, consumer.lastMessage);
                     this.activeConsumers.delete(queue);
@@ -824,15 +863,19 @@ class RabbitMQConsumer {
         } catch (error) {
             console.error(`Error processing message for queue ${queue}:`, error);
 
-            if (!this.isChannelOpen()) {
-                console.log(`Channel closed, cannot ack/nack message from queue ${queue}`);
-                this.activeConsumers.delete(queue);
+            // Verificar versão antes de qualquer operação no channel
+            if (!this.isChannelOpen() || expectedChannelVersion !== this.channelVersion) {
+                console.log(`Channel changed, skipping error handling for queue ${queue}`);
                 return;
             }
 
             if (error.response) {
                 console.log(`Webhook error, discarding message for queue ${queue}`);
-                this.channel.ack(msg);
+                try {
+                    this.channel.ack(msg);
+                } catch (ackError) {
+                    console.error(`Error acking message for queue ${queue}:`, ackError);
+                }
             } else if (error.code === 404 && error.message.includes('no queue')) {
                 console.log(`Queue ${queue} was deleted, removing consumer`);
                 this.activeConsumers.delete(queue);
@@ -863,6 +906,8 @@ class RabbitMQConsumer {
 
             // Criar channel
             this.channel = await this.connection.createChannel();
+            this.channelVersion++;  // Incrementar versão para invalidar callbacks antigas
+            console.log(`Initial channel version ${this.channelVersion}`);
             await this.channel.prefetch(1);
 
             // Handlers do channel
