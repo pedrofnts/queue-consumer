@@ -27,8 +27,19 @@ class RabbitMQConsumer {
         try {
             // Garantir que o diretório existe
             const dbDir = path.dirname(DB_PATH);
-            if (!fs.existsSync(dbDir)) {
-                fs.mkdirSync(dbDir, { recursive: true });
+            
+            console.log(`Attempting to initialize SQLite at: ${DB_PATH}`);
+            console.log(`Database directory: ${dbDir}`);
+            
+            try {
+                if (!fs.existsSync(dbDir)) {
+                    console.log(`Creating directory: ${dbDir}`);
+                    fs.mkdirSync(dbDir, { recursive: true });
+                }
+            } catch (dirError) {
+                console.error(`Failed to create directory ${dbDir}:`, dirError);
+                console.error('Directory permissions:', fs.statSync(path.dirname(dbDir)));
+                throw dirError;
             }
 
             // Inicializar SQLite
@@ -50,9 +61,12 @@ class RabbitMQConsumer {
                 )
             `);
 
-            console.log('SQLite database initialized at:', DB_PATH);
+            console.log('SQLite database initialized successfully at:', DB_PATH);
         } catch (error) {
             console.error('CRITICAL: Failed to initialize SQLite database:', error);
+            console.error('DB_PATH:', DB_PATH);
+            console.error('Current working directory:', process.cwd());
+            console.error('Process user:', process.getuid ? `UID: ${process.getuid()}, GID: ${process.getgid()}` : 'N/A');
             console.error('Exiting process to force restart...');
             process.exit(1);
         }

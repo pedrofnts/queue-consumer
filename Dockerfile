@@ -1,5 +1,8 @@
 FROM node:18-alpine
 
+# Install build dependencies for better-sqlite3
+RUN apk add --no-cache python3 make g++
+
 # Set working directory
 WORKDIR /app
 
@@ -17,8 +20,9 @@ RUN npm install --only=production && \
 # Copy application code
 COPY . .
 
-# Change ownership to nodejs user
-RUN chown -R nodejs:nodejs /app
+# Create data directory for SQLite with proper permissions
+RUN mkdir -p /data && \
+    chown -R nodejs:nodejs /app /data
 
 # Switch to non-root user
 USER nodejs
