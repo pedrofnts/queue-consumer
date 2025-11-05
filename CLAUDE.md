@@ -32,7 +32,7 @@ npm install
 Required environment variables:
 - `RABBITMQ_URL`: RabbitMQ connection URL (required)
 - `FINISH_WEBHOOK`: Webhook URL called when a queue is emptied (required)
-- `REDIS_URL`: Redis connection URL for persistence (default: redis://localhost:6379)
+- `DB_PATH`: SQLite database file path for persistence (default: /data/consumers.db)
 - `API_PORT`: API server port (default: 3000)
 - `MAX_RECONNECT_ATTEMPTS`: Maximum reconnection attempts before forcing container restart (default: 10)
 
@@ -42,7 +42,7 @@ Required environment variables:
 
 The service uses a single-class architecture (`RabbitMQConsumer`) that manages:
 1. RabbitMQ connection and channel lifecycle
-2. Redis connection for consumer configuration persistence
+2. SQLite database for consumer configuration persistence
 3. Express API server for queue management
 4. Multiple concurrent queue consumers with individual configurations
 5. Message processing with interval-based throttling
@@ -142,32 +142,44 @@ Queue names must be:
 Webhook URLs must:
 - Start with "http"
 
-## Persistence with Redis
+## Persistence with SQLite
 
-**Consumer State Persistence** (index.js:45-127)
-The service persists consumer configurations in Redis to survive container restarts:
+**Consumer State Persistence** (index.js:67-170)
+The service persists consumer configurations in SQLite to survive container restarts:
 
 **Data Structure:**
-Each consumer is stored as a Redis hash at key `consumer:{queue}` with fields:
-- `webhook`: Target webhook URL
-- `minInterval`: Minimum interval in milliseconds
-- `maxInterval`: Maximum interval in milliseconds
-- `businessHoursStart`: Start hour (0-23)
-- `businessHoursEnd`: End hour (0-23)
-- `paused`: Boolean state ("true"/"false")
+Consumers table schema:
+- `queue` (TEXT PRIMARY KEY): Queue name
+- `webhook` (TEXT NOT NULL): Target webhook URL
+- `minInterval` (INTEGER NOT NULL): Minimum interval in milliseconds
+- `maxInterval` (INTEGER NOT NULL): Maximum interval in milliseconds
+- `businessHoursStart` (INTEGER NOT NULL): Start hour (0-23)
+- `businessHoursEnd` (INTEGER NOT NULL): End hour (0-23)
+- `paused` (INTEGER DEFAULT 0): Boolean state (0/1)
+- `created_at` (DATETIME): Creation timestamp
+- `updated_at` (DATETIME): Last update timestamp
 
 **Persistence Operations:**
-- `saveConsumerToRedis()`: Saves consumer config when started via POST /consume
-- `deleteConsumerFromRedis()`: Removes config when stopped via POST /stop
+- `saveConsumerToDb()`: Saves consumer config when started via POST /consume
+  - Uses INSERT OR REPLACE for upsert behavior
+  - **CRITICAL**: Exits process with code 1 on database write failure
+- `deleteConsumerFromDb()`: Removes config when queue is stopped or completed
+  - Called when queue is empty or via POST /stop
+  - **CRITICAL**: Exits process with code 1 on database write failure
 - `updateConsumerPausedState()`: Updates paused state via POST /pause and /resume
-- `loadConsumersFromRedis()`: Restores all consumers on service startup
+  - **CRITICAL**: Exits process with code 1 on database write failure
+- `loadConsumersFromDb()`: Restores all consumers on service startup
+  - **CRITICAL**: Exits process with code 1 on database read failure
 
 **Automatic Recovery:**
 On service start, after RabbitMQ connection:
-1. Scans Redis for all `consumer:*` keys
+1. Queries all consumers from SQLite database
 2. For each saved consumer, attempts to recreate the RabbitMQ consumer
-3. If queue no longer exists in RabbitMQ, removes the stale config from Redis
-4. Restores paused state if applicable
+3. If queue no longer exists in RabbitMQ, removes the stale config from database
+4. Restores paused state IMMEDIATELY after consumer creation
+
+**Critical Bug Fix:**
+Previous implementation had a bug where consumers were not deleted from persistence when queues became empty. This caused the system to attempt restoring consumers for non-existent queues after restart. The fix ensures `deleteConsumerFromDb()` is called whenever a queue is emptied (line 730).
 
 **Automatic Reconnection System** (index.js:131-248)
 The service has a robust multi-level reconnection strategy:
@@ -183,15 +195,15 @@ The service has a robust multi-level reconnection strategy:
 - Resets counter to 0 after successful reconnection
 - If reconnection fails `MAX_RECONNECT_ATTEMPTS` times (default: 10):
   - Logs failure message
-  - Gracefully closes all resources (channel, connection, Redis)
+  - Gracefully closes all resources (channel, connection, SQLite database)
   - Exits process with code 1
   - Docker/Kubernetes will automatically restart the container
-  - On restart, consumers are restored from Redis
+  - On restart, consumers are restored from SQLite database
 
 **Recovery Timeline:**
 - Channel-only recreation: 2 second retry interval
 - Full reconnection: 5 second retry interval
-- After each successful reconnection, all consumers are restored from Redis
+- After each successful reconnection, all consumers are restored from SQLite database
 
 **Why Force Restart:**
-In extreme cases where reconnection consistently fails (e.g., network issues, RabbitMQ cluster changes, corrupted state), forcing a container restart provides a clean slate while maintaining consumer configurations via Redis persistence.
+In extreme cases where reconnection consistently fails (e.g., network issues, RabbitMQ cluster changes, corrupted state), forcing a container restart provides a clean slate while maintaining consumer configurations via SQLite persistence. SQLite provides more reliable persistence than Redis as it's a file-based database with ACID guarantees and doesn't require a separate service.

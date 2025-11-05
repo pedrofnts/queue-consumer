@@ -2,13 +2,15 @@ const amqp = require('amqplib');
 const axios = require('axios');
 const express = require('express');
 const { zonedTimeToUtc, utcToZonedTime, format } = require('date-fns-tz');
-const Redis = require('ioredis');
+const Database = require('better-sqlite3');
+const path = require('path');
+const fs = require('fs');
 
 const RABBITMQ_URL = process.env.RABBITMQ_URL;
 const API_PORT = process.env.API_PORT || 3000;
 const TIMEZONE = 'America/Sao_Paulo';
 const FINISH_WEBHOOK = process.env.FINISH_WEBHOOK;
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const DB_PATH = process.env.DB_PATH || '/data/consumers.db';
 const MAX_RECONNECT_ATTEMPTS = parseInt(process.env.MAX_RECONNECT_ATTEMPTS) || 10;
 
 class RabbitMQConsumer {
@@ -21,21 +23,39 @@ class RabbitMQConsumer {
         this.isReconnecting = false;
         this.reconnectAttempts = 0;
         this.lastSuccessfulConnection = Date.now();
-        this.redis = new Redis(REDIS_URL, {
-            retryStrategy(times) {
-                const delay = Math.min(times * 50, 2000);
-                return delay;
-            },
-            maxRetriesPerRequest: 3
-        });
+        
+        try {
+            // Garantir que o diretório existe
+            const dbDir = path.dirname(DB_PATH);
+            if (!fs.existsSync(dbDir)) {
+                fs.mkdirSync(dbDir, { recursive: true });
+            }
 
-        this.redis.on('error', (err) => {
-            console.error('Redis connection error:', err);
-        });
+            // Inicializar SQLite
+            this.db = new Database(DB_PATH);
+            this.db.pragma('journal_mode = WAL');
+            
+            // Criar tabela se não existir
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS consumers (
+                    queue TEXT PRIMARY KEY,
+                    webhook TEXT NOT NULL,
+                    minInterval INTEGER NOT NULL,
+                    maxInterval INTEGER NOT NULL,
+                    businessHoursStart INTEGER NOT NULL,
+                    businessHoursEnd INTEGER NOT NULL,
+                    paused INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            `);
 
-        this.redis.on('connect', () => {
-            console.log('Connected to Redis');
-        });
+            console.log('SQLite database initialized at:', DB_PATH);
+        } catch (error) {
+            console.error('CRITICAL: Failed to initialize SQLite database:', error);
+            console.error('Exiting process to force restart...');
+            process.exit(1);
+        }
 
         this.setupAPI();
     }
@@ -44,87 +64,108 @@ class RabbitMQConsumer {
         return this.channel && !this.channel.closing && !this.channel.closed;
     }
 
-    async saveConsumerToRedis(queue, webhook, minInterval, maxInterval, businessHours, paused = false) {
+    saveConsumerToDb(queue, webhook, minInterval, maxInterval, businessHours, paused = false) {
         try {
-            await this.redis.hset(`consumer:${queue}`, {
+            const stmt = this.db.prepare(`
+                INSERT OR REPLACE INTO consumers 
+                (queue, webhook, minInterval, maxInterval, businessHoursStart, businessHoursEnd, paused, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            `);
+            
+            stmt.run(
+                queue,
                 webhook,
-                minInterval: minInterval.toString(),
-                maxInterval: maxInterval.toString(),
-                businessHoursStart: businessHours.start.toString(),
-                businessHoursEnd: businessHours.end.toString(),
-                paused: paused.toString()
-            });
-            console.log(`Saved consumer config for queue ${queue} to Redis`);
+                minInterval,
+                maxInterval,
+                businessHours.start,
+                businessHours.end,
+                paused ? 1 : 0
+            );
+            
+            console.log(`Saved consumer config for queue ${queue} to database`);
         } catch (error) {
-            console.error(`Error saving consumer to Redis for queue ${queue}:`, error);
+            console.error(`CRITICAL: Failed to save consumer to database for queue ${queue}:`, error);
+            console.error('Database write failure - exiting to force restart...');
+            process.exit(1);
         }
     }
 
-    async deleteConsumerFromRedis(queue) {
+    deleteConsumerFromDb(queue) {
         try {
-            await this.redis.del(`consumer:${queue}`);
-            console.log(`Deleted consumer config for queue ${queue} from Redis`);
+            const stmt = this.db.prepare('DELETE FROM consumers WHERE queue = ?');
+            stmt.run(queue);
+            console.log(`Deleted consumer config for queue ${queue} from database`);
         } catch (error) {
-            console.error(`Error deleting consumer from Redis for queue ${queue}:`, error);
+            console.error(`CRITICAL: Failed to delete consumer from database for queue ${queue}:`, error);
+            console.error('Database write failure - exiting to force restart...');
+            process.exit(1);
         }
     }
 
-    async updateConsumerPausedState(queue, paused) {
+    updateConsumerPausedState(queue, paused) {
         try {
-            await this.redis.hset(`consumer:${queue}`, 'paused', paused.toString());
+            const stmt = this.db.prepare(`
+                UPDATE consumers 
+                SET paused = ?, updated_at = CURRENT_TIMESTAMP 
+                WHERE queue = ?
+            `);
+            stmt.run(paused ? 1 : 0, queue);
             console.log(`Updated paused state for queue ${queue} to ${paused}`);
         } catch (error) {
-            console.error(`Error updating paused state in Redis for queue ${queue}:`, error);
+            console.error(`CRITICAL: Failed to update paused state in database for queue ${queue}:`, error);
+            console.error('Database write failure - exiting to force restart...');
+            process.exit(1);
         }
     }
 
-    async loadConsumersFromRedis() {
+    async loadConsumersFromDb() {
         try {
-            const keys = await this.redis.keys('consumer:*');
-            console.log(`Found ${keys.length} consumers in Redis to restore`);
+            const stmt = this.db.prepare('SELECT * FROM consumers');
+            const consumers = stmt.all();
+            
+            console.log(`Found ${consumers.length} consumers in database to restore`);
 
-            for (const key of keys) {
-                const queue = key.replace('consumer:', '');
-                const config = await this.redis.hgetall(key);
-
-                if (!config || !config.webhook) {
-                    console.log(`Invalid config for ${queue}, skipping`);
+            for (const config of consumers) {
+                if (!config.webhook) {
+                    console.log(`Invalid config for ${config.queue}, skipping`);
                     continue;
                 }
 
                 const businessHours = {
-                    start: parseInt(config.businessHoursStart),
-                    end: parseInt(config.businessHoursEnd)
+                    start: config.businessHoursStart,
+                    end: config.businessHoursEnd
                 };
+
+                const paused = config.paused === 1;
 
                 try {
                     await this.startConsuming(
-                        queue,
+                        config.queue,
                         config.webhook,
-                        parseInt(config.minInterval),
-                        parseInt(config.maxInterval),
+                        config.minInterval,
+                        config.maxInterval,
                         businessHours
                     );
 
-                    // Restaurar estado pausado se necessário
-                    if (config.paused === 'true') {
-                        const consumer = this.activeConsumers.get(queue);
-                        if (consumer) {
-                            consumer.paused = true;
-                        }
+                    // Restaurar estado pausado IMEDIATAMENTE
+                    const consumer = this.activeConsumers.get(config.queue);
+                    if (consumer) {
+                        consumer.paused = paused;
                     }
 
-                    console.log(`Restored consumer for queue ${queue}`);
+                    console.log(`Restored consumer for queue ${config.queue}${paused ? ' (paused)' : ''}`);
                 } catch (error) {
-                    console.error(`Failed to restore consumer for queue ${queue}:`, error.message);
-                    // Se a fila não existe mais, remove do Redis
+                    console.error(`Failed to restore consumer for queue ${config.queue}:`, error.message);
+                    // Se a fila não existe mais, remove do banco
                     if (error.message.includes('does not exist')) {
-                        await this.deleteConsumerFromRedis(queue);
+                        this.deleteConsumerFromDb(config.queue);
                     }
                 }
             }
         } catch (error) {
-            console.error('Error loading consumers from Redis:', error);
+            console.error('CRITICAL: Error loading consumers from database:', error);
+            console.error('Database read failure - exiting to force restart...');
+            process.exit(1);
         }
     }
 
@@ -148,7 +189,7 @@ class RabbitMQConsumer {
             try {
                 if (this.channel) await this.channel.close();
                 if (this.connection) await this.connection.close();
-                if (this.redis) await this.redis.quit();
+                if (this.db) this.db.close();
             } catch (err) {
                 console.error('Error closing resources:', err);
             }
@@ -220,7 +261,7 @@ class RabbitMQConsumer {
                         await this.notifyQueueFinish(queue, data.lastMessage);
                         console.log(`Queue ${queue} was deleted or cancelled`);
                         this.activeConsumers.delete(queue);
-                        await this.deleteConsumerFromRedis(queue);
+                        await this.deleteConsumerFromDb(queue);
                         break;
                     }
                 }
@@ -235,8 +276,8 @@ class RabbitMQConsumer {
             // Limpar antes de recriar
             this.activeConsumers.clear();
 
-            // Restaurar consumers salvos no Redis
-            await this.loadConsumersFromRedis();
+            // Restaurar consumers salvos no banco
+            await this.loadConsumersFromDb();
 
         } catch (error) {
             console.error('Error during reconnection:', error);
@@ -290,7 +331,7 @@ class RabbitMQConsumer {
                         await this.notifyQueueFinish(queue, data.lastMessage);
                         console.log(`Queue ${queue} was deleted or cancelled`);
                         this.activeConsumers.delete(queue);
-                        await this.deleteConsumerFromRedis(queue);
+                        await this.deleteConsumerFromDb(queue);
                         break;
                     }
                 }
@@ -301,8 +342,8 @@ class RabbitMQConsumer {
             // Limpar antes de recriar
             this.activeConsumers.clear();
 
-            // Restaurar consumers do Redis
-            await this.loadConsumersFromRedis();
+            // Restaurar consumers do banco
+            await this.loadConsumersFromDb();
 
         } catch (error) {
             console.error('Error recreating channel:', error);
@@ -400,7 +441,7 @@ class RabbitMQConsumer {
                 }
 
                 await this.startConsuming(queue, webhook, minInterval, maxInterval, businessHours);
-                await this.saveConsumerToRedis(queue, webhook, minInterval, maxInterval, businessHours);
+                await this.saveConsumerToDb(queue, webhook, minInterval, maxInterval, businessHours);
 
                 res.json({
                     message: `Started consuming queue ${queue}`,
@@ -555,7 +596,7 @@ class RabbitMQConsumer {
                 await this.channel.cancel(consumer.consumerTag);
                 await this.notifyQueueFinish(queue, consumer.lastMessage);
                 this.activeConsumers.delete(queue);
-                await this.deleteConsumerFromRedis(queue);
+                await this.deleteConsumerFromDb(queue);
 
                 res.json({ message: `Queue ${queue} consumption has been stopped` });
             } catch (error) {
@@ -686,6 +727,7 @@ class RabbitMQConsumer {
                     await this.channel.cancel(consumer.consumerTag);
                     await this.notifyQueueFinish(queue, consumer.lastMessage);
                     this.activeConsumers.delete(queue);
+                    this.deleteConsumerFromDb(queue);  // FIX: Remover do banco quando fila termina
                     console.log(`Queue ${queue} is empty, consumer removed`);
                 }
             } else {
@@ -762,7 +804,7 @@ class RabbitMQConsumer {
                         await this.notifyQueueFinish(queue, data.lastMessage);
                         console.log(`Queue ${queue} was deleted or cancelled`);
                         this.activeConsumers.delete(queue);
-                        await this.deleteConsumerFromRedis(queue);
+                        await this.deleteConsumerFromDb(queue);
                         break;
                     }
                 }
@@ -785,8 +827,8 @@ class RabbitMQConsumer {
         if (this.connection) {
             await this.connection.close();
         }
-        if (this.redis) {
-            await this.redis.quit();
+        if (this.db) {
+            this.db.close();
         }
         process.exit(0);
     }
@@ -804,8 +846,8 @@ class RabbitMQConsumer {
 
         await this.connect();
 
-        // Restaurar consumers salvos no Redis
-        await this.loadConsumersFromRedis();
+        // Restaurar consumers salvos no banco
+        await this.loadConsumersFromDb();
 
         process.on('SIGINT', this.handleShutdown.bind(this));
         process.on('SIGTERM', this.handleShutdown.bind(this));

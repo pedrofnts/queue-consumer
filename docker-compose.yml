@@ -5,10 +5,13 @@ services:
     image: rabbitmq-consumer:latest
     networks:
       - isz
+    volumes:
+      - consumer-data:/data
     environment:
       RABBITMQ_URL: amqp://iszp:40e113ad1f5c72a411a46e1fd2d57e4b@rabbitmq:5672
       FINISH_WEBHOOK: https://req.iszap.com.br/webhook/finish
       API_PORT: 3000
+      DB_PATH: /data/consumers.db
       NODE_OPTIONS: "--max-old-space-size=4096"
     deploy:
       mode: replicated
@@ -24,6 +27,10 @@ services:
         - traefik.http.routers.consumer.tls.certresolver=letsencryptresolver
         - traefik.http.routers.consumer.service=consumer
         - traefik.http.services.consumer.loadbalancer.server.port=3000
+
+volumes:
+  consumer-data:
+    driver: local
 
 networks:
   isz:
