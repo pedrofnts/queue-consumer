@@ -44,7 +44,11 @@ class RabbitMQConsumer {
 
             // Inicializar SQLite
             this.db = new Database(DB_PATH);
+            
+            // Configurações para máxima durabilidade
             this.db.pragma('journal_mode = WAL');
+            this.db.pragma('synchronous = FULL');  // Garante sync em disco
+            this.db.pragma('wal_autocheckpoint = 100');  // Checkpoint frequente
             
             // Criar tabela se não existir
             this.db.exec(`
@@ -96,7 +100,10 @@ class RabbitMQConsumer {
                 paused ? 1 : 0
             );
             
-            console.log(`Saved consumer config for queue ${queue} to database`);
+            // Forçar checkpoint WAL para garantir escrita em disco
+            this.db.pragma('wal_checkpoint(FULL)');
+            
+            console.log(`✅ Saved and synced consumer config for queue ${queue} to database`);
         } catch (error) {
             console.error(`CRITICAL: Failed to save consumer to database for queue ${queue}:`, error);
             console.error('Database write failure - exiting to force restart...');
@@ -108,7 +115,11 @@ class RabbitMQConsumer {
         try {
             const stmt = this.db.prepare('DELETE FROM consumers WHERE queue = ?');
             stmt.run(queue);
-            console.log(`Deleted consumer config for queue ${queue} from database`);
+            
+            // Forçar checkpoint WAL para garantir escrita em disco
+            this.db.pragma('wal_checkpoint(FULL)');
+            
+            console.log(`✅ Deleted and synced consumer config for queue ${queue} from database`);
         } catch (error) {
             console.error(`CRITICAL: Failed to delete consumer from database for queue ${queue}:`, error);
             console.error('Database write failure - exiting to force restart...');
@@ -124,7 +135,11 @@ class RabbitMQConsumer {
                 WHERE queue = ?
             `);
             stmt.run(paused ? 1 : 0, queue);
-            console.log(`Updated paused state for queue ${queue} to ${paused}`);
+            
+            // Forçar checkpoint WAL para garantir escrita em disco
+            this.db.pragma('wal_checkpoint(FULL)');
+            
+            console.log(`✅ Updated and synced paused state for queue ${queue} to ${paused}`);
         } catch (error) {
             console.error(`CRITICAL: Failed to update paused state in database for queue ${queue}:`, error);
             console.error('Database write failure - exiting to force restart...');
@@ -134,10 +149,33 @@ class RabbitMQConsumer {
 
     async loadConsumersFromDb() {
         try {
+            // Debug: verificar arquivo do banco
+            try {
+                const stats = fs.statSync(DB_PATH);
+                console.log(`📁 Database file size: ${stats.size} bytes, modified: ${stats.mtime}`);
+                
+                // Verificar WAL file
+                const walPath = DB_PATH + '-wal';
+                if (fs.existsSync(walPath)) {
+                    const walStats = fs.statSync(walPath);
+                    console.log(`📁 WAL file size: ${walStats.size} bytes`);
+                }
+            } catch (statError) {
+                console.log('Could not stat database file:', statError.message);
+            }
+            
+            // Verificar integridade do banco antes de ler
+            const checkpointResult = this.db.pragma('wal_checkpoint(PASSIVE)');
+            console.log('WAL checkpoint status:', checkpointResult);
+            
             const stmt = this.db.prepare('SELECT * FROM consumers');
             const consumers = stmt.all();
             
-            console.log(`Found ${consumers.length} consumers in database to restore`);
+            console.log(`📊 Found ${consumers.length} consumers in database to restore`);
+            
+            if (consumers.length > 0) {
+                console.log('Consumers to restore:', consumers.map(c => c.queue).join(', '));
+            }
 
             for (const config of consumers) {
                 if (!config.webhook) {
@@ -203,7 +241,11 @@ class RabbitMQConsumer {
             try {
                 if (this.channel) await this.channel.close();
                 if (this.connection) await this.connection.close();
-                if (this.db) this.db.close();
+                if (this.db) {
+                    console.log('Performing final database checkpoint before exit...');
+                    this.db.pragma('wal_checkpoint(TRUNCATE)');
+                    this.db.close();
+                }
             } catch (err) {
                 console.error('Error closing resources:', err);
             }
@@ -618,6 +660,26 @@ class RabbitMQConsumer {
             }
         });
 
+        // Endpoint de debug para verificar banco de dados
+        app.get('/debug/db', (req, res) => {
+            try {
+                const stmt = this.db.prepare('SELECT * FROM consumers');
+                const consumers = stmt.all();
+                
+                const stats = fs.statSync(DB_PATH);
+                
+                res.json({
+                    database_path: DB_PATH,
+                    file_size: stats.size,
+                    modified: stats.mtime,
+                    consumers: consumers,
+                    count: consumers.length
+                });
+            } catch (error) {
+                res.status(500).json({ error: error.message });
+            }
+        });
+
         app.listen(API_PORT, () => {
             console.log(`API server listening on port ${API_PORT}`);
         });
@@ -842,7 +904,15 @@ class RabbitMQConsumer {
             await this.connection.close();
         }
         if (this.db) {
-            this.db.close();
+            try {
+                // Checkpoint final antes de fechar
+                console.log('Performing final database checkpoint...');
+                this.db.pragma('wal_checkpoint(TRUNCATE)');
+                this.db.close();
+                console.log('Database closed successfully');
+            } catch (error) {
+                console.error('Error closing database:', error);
+            }
         }
         process.exit(0);
     }

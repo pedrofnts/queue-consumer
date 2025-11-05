@@ -95,15 +95,24 @@ Quando uma operação crítica de banco falha, o estado em memória fica inconsi
 
 ### Primeira Instalação (Novo Deploy)
 ```bash
-# Instalar dependências
+# Instalar dependências localmente (opcional, para testes)
 npm install
 
-# Rebuild da imagem Docker
+# Rebuild da imagem Docker (IMPORTANTE: better-sqlite3 precisa de build tools)
 docker build -t rabbitmq-consumer:latest .
 
 # Deploy
 docker stack deploy -c docker-compose.yml consumer
 ```
+
+### ⚠️ Importante sobre o Dockerfile
+
+O Dockerfile foi atualizado para:
+1. **Instalar build tools** (python3, make, g++) necessários para compilar better-sqlite3
+2. **Criar diretório `/data`** com permissões corretas para o usuário nodejs
+3. **Dar ownership** do diretório `/data` para o usuário não-root
+
+Essas mudanças são **críticas** para que o SQLite funcione corretamente.
 
 ### Migração de Instalação Existente
 
