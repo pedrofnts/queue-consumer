@@ -45,6 +45,12 @@ class RabbitMQConsumer {
             // Inicializar SQLite
             this.db = new Database(DB_PATH);
             
+            // CRÍTICO: Consolidar WAL ANTES de qualquer operação
+            // Isso garante que dados de crashes anteriores sejam recuperados
+            console.log('Consolidating WAL on database open...');
+            const restoreCheckpoint = this.db.pragma('wal_checkpoint(RESTART)');
+            console.log('WAL restore checkpoint result:', restoreCheckpoint);
+            
             // Configurações para máxima durabilidade
             this.db.pragma('journal_mode = WAL');
             this.db.pragma('synchronous = FULL');  // Garante sync em disco
@@ -159,22 +165,25 @@ class RabbitMQConsumer {
                 if (fs.existsSync(walPath)) {
                     const walStats = fs.statSync(walPath);
                     console.log(`📁 WAL file size: ${walStats.size} bytes`);
+                    
+                    if (walStats.size > 0) {
+                        console.log('⚠️  WARNING: WAL file has data - checkpoint should have been done on open');
+                    }
                 }
             } catch (statError) {
                 console.log('Could not stat database file:', statError.message);
             }
             
-            // Verificar integridade do banco antes de ler
-            const checkpointResult = this.db.pragma('wal_checkpoint(PASSIVE)');
-            console.log('WAL checkpoint status:', checkpointResult);
-            
+            // Query direto - o checkpoint já foi feito no construtor
             const stmt = this.db.prepare('SELECT * FROM consumers');
             const consumers = stmt.all();
             
             console.log(`📊 Found ${consumers.length} consumers in database to restore`);
             
             if (consumers.length > 0) {
-                console.log('Consumers to restore:', consumers.map(c => c.queue).join(', '));
+                console.log('✅ Consumers to restore:', consumers.map(c => c.queue).join(', '));
+            } else {
+                console.log('⚠️  No consumers found - database may be empty or checkpoint failed');
             }
 
             for (const config of consumers) {
